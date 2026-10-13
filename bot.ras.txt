@@ -1,0 +1,159 @@
+import json
+import os
+import re
+import threading
+import time
+from datetime import date, datetime, timedelta
+
+import telebot
+
+# ====================== НАСТРОЙКИ ======================
+TOKEN = os.getenv("BOT_TOKEN") or "8601318919:AAE3OJ6uoTxACUodkowWw4vFBFW1-OBXk60"
+MY_ID = 6594214816          # твой ID, узнай командой /myid после первого запуска
+NAME = "Макс"      # как бот будет к тебе обращаться
+WARN_MINUTES = 10  # за сколько минут предупреждать перед уроком
+
+# Расписание звонков (меняется редко, задаётся один раз).
+# Ключ — номер урока, значение — (начало "ЧЧ:ММ", конец "ЧЧ:ММ").
+BELLS = {
+    0: ("13:10", "13:50"),
+    1: ("14:00", "14:40"),
+    2: ("14:50", "15:30"),
+    3: ("15:40", "16:20"),
+    4: ("16:40", "17:20"),
+    5: ("17:30", "18:10"),
+    6: ("18:20", "19:00"),
+}
+# =========================================================
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+TODAY_FILE = os.path.join(BASE, "today.json")
+
+bot = telebot.TeleBot(TOKEN)
+already_sent = set()
+
+
+# ---------- хранение дневного расписания ----------
+def load_today():
+    if os.path.exists(TODAY_FILE):
+        with open(TODAY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") == date.today().isoformat():
+            return data["lessons"]  # {"1": "Химия", "3": "Физика", ...}
+    return {}
+
+
+def save_today(lessons):
+    with open(TODAY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"date": date.today().isoformat(), "lessons": lessons}, f, ensure_ascii=False, indent=2)
+
+
+def parse_lessons(text):
+    """
+    Разбирает текст вида:
+        0.
+        1. Химия
+        2. Алгебра
+    или даже всё в одну строку: "0.    1.Химия 2. Алгебра".
+    Урок без названия после номера (как "0." без текста) просто пропускается —
+    бот не будет на него напоминать.
+    """
+    pairs = re.findall(r"(\d+)\s*[.)]\s*([^\d]*)", text)
+    lessons = {}
+    for num, subject in pairs:
+        subject = subject.strip(" \t\n.,;-")
+        if subject:  # пустой текст после номера — урока в этот день нет, пропускаем
+            lessons[num] = subject
+    return lessons
+
+
+def format_lessons(lessons):
+    lines = []
+    for num in sorted(lessons, key=int):
+        n = int(num)
+        if n in BELLS:
+            start_t, end_t = BELLS[n]
+            lines.append(f"{n}. {start_t}–{end_t} · {lessons[num]}")
+        else:
+            lines.append(f"{n}. (нет в расписании звонков) · {lessons[num]}")
+    return lines
+
+
+# ---------- команды ----------
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.send_message(message.chat.id,
+                     f"Привет! Я буду напоминать {NAME} об уроках.\n\n"
+                     "Каждое утро пришли мне список уроков на день, например:\n"
+                     "1. Химия\n2. Алгебра\n4. Физика\n\n"
+                     "Номер — это номер урока по расписанию звонков. Если какого-то "
+                     "урока в этот день нет, просто не упоминай его номер.\n\n"
+                     "/today — что я запомнил на сегодня\n"
+                     "/bells — расписание звонков\n"
+                     "/myid — узнать свой ID")
+
+
+@bot.message_handler(commands=['myid'])
+def my_id(message):
+    bot.send_message(message.chat.id, f"Твой ID: {message.chat.id}")
+
+
+@bot.message_handler(commands=['bells'])
+def bells(message):
+    lines = [f"{n}. {s}–{e}" for n, (s, e) in sorted(BELLS.items())]
+    bot.send_message(message.chat.id, "🔔 Расписание звонков:\n\n" + "\n".join(lines))
+
+
+@bot.message_handler(commands=['today'])
+def today(message):
+    lessons = load_today()
+    if not lessons:
+        bot.send_message(message.chat.id, "На сегодня уроки ещё не присланы.")
+        return
+    bot.send_message(message.chat.id, "Сегодня:\n\n" + "\n".join(format_lessons(lessons)))
+
+
+# ---------- приём расписания текстом ----------
+@bot.message_handler(func=lambda m: m.text and not m.text.startswith('/'))
+def on_text(message):
+    if MY_ID and message.chat.id != MY_ID:
+        return
+    lessons = parse_lessons(message.text)
+    if not lessons:
+        bot.send_message(message.chat.id,
+                         "Не нашёл ни одного урока в сообщении. Пришли в формате:\n1. Химия\n2. Алгебра")
+        return
+    save_today(lessons)
+    already_sent.clear()  # новый день — старые пометки о присланных напоминаниях больше не нужны
+    bot.send_message(message.chat.id, "✅ Записал на сегодня:\n\n" + "\n".join(format_lessons(lessons)))
+
+
+# ---------- фоновая проверка расписания ----------
+def check_loop():
+    while True:
+        now = datetime.now()
+        today_key = now.strftime("%Y-%m-%d")
+        lessons = load_today()
+
+        for num_str, subject in lessons.items():
+            num = int(num_str)
+            if num not in BELLS:
+                continue
+            start_t, end_t = BELLS[num]
+            lesson_start = datetime.strptime(f"{today_key} {start_t}", "%Y-%m-%d %H:%M")
+            warn_time = lesson_start - timedelta(minutes=WARN_MINUTES)
+            event_key = (today_key, num)
+
+            if warn_time <= now < lesson_start and event_key not in already_sent:
+                already_sent.add(event_key)
+                if MY_ID:
+                    minutes_left = round((lesson_start - now).total_seconds() / 60)
+                    bot.send_message(MY_ID,
+                                     f"{NAME}, через {minutes_left} мин. {subject} "
+                                     f"(урок {num}). Начало в {start_t}, закончится в {end_t}.")
+        time.sleep(20)
+
+
+bot.delete_webhook()
+threading.Thread(target=check_loop, daemon=True).start()
+bot.infinity_polling()
